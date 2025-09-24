@@ -1,0 +1,349 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Xml.Serialization;
+using NinjaTrader.Cbi;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.Gui.SuperDom;
+using NinjaTrader.Gui.Tools;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.Core.FloatingPoint;
+using NinjaTrader.NinjaScript.Indicators;
+using NinjaTrader.NinjaScript.DrawingTools;
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class ConditionalLevelStrategy : Strategy
+    {
+        private double levelA;
+        private double levelB;
+        private double levelC;
+        private double levelD;
+        
+        // Time tracking variables
+        private DateTime lastBelowLevelCTime = DateTime.MinValue;
+        private DateTime lastAboveLevelATime = DateTime.MinValue;
+        
+        // State tracking
+        private bool hasDroppedBelowLevelC = false;
+        private bool hasGoneAboveLevelA = false;
+        private bool buyConditionMet = false;
+        private bool sellConditionMet = false;
+        
+        // Trailing stop variables
+        private double trailingStopPrice = 0;
+        private bool isLong = false;
+        private bool isShort = false;
+        
+        // Order tracking
+        private Order buyOrder = null;
+        private Order sellOrder = null;
+        private Order stopOrder = null;
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Description = @"Strategy that places buy orders at LevelB when price drops below LevelC first, and sell orders at LevelD when price goes above LevelA first, with time constraints and trailing stops.";
+                Name = "ConditionalLevelStrategy";
+                Calculate = Calculate.OnBarClose;
+                EntriesPerDirection = 1;
+                EntryHandling = EntryHandling.AllEntries;
+                IsExitOnSessionCloseStrategy = true;
+                ExitOnSessionCloseSeconds = 30;
+                IsFillLimitOnTouch = false;
+                MaximumBarsLookBack = MaximumBarsLookBack.TwoHundredFiftySix;
+                OrderFillResolution = OrderFillResolution.Standard;
+                Slippage = 0;
+                StartBehavior = StartBehavior.WaitUntilFlat;
+                TimeInForce = TimeInForce.Gtc;
+                TraceOrders = false;
+                RealtimeErrorHandling = RealtimeErrorHandling.StopCancelClose;
+                StopTargetHandling = StopTargetHandling.PerEntryExecution;
+                BarsRequiredToTrade = 20;
+                IsInstantiatedOnEachOptimizationIteration = true;
+                
+                // Default level values - these should be set by user
+                LevelA = 4150;
+                LevelB = 4100;
+                LevelC = 4120;
+                LevelD = 4180;
+                TrailingStopTicks = 4;
+            }
+            else if (State == State.Configure)
+            {
+                // Add any additional configuration here
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            if (BarsInProgress != 0 || CurrentBars[0] < BarsRequiredToTrade)
+                return;
+
+            double currentPrice = Close[0];
+            DateTime currentTime = Time[0];
+            
+            // Check for price dropping below LevelC for the first time in past 30 minutes
+            CheckBelowLevelC(currentPrice, currentTime);
+            
+            // Check for price going above LevelA for the first time in past 30 minutes
+            CheckAboveLevelA(currentPrice, currentTime);
+            
+            // Check buy condition at LevelB
+            CheckBuyCondition(currentPrice, currentTime);
+            
+            // Check sell condition at LevelD
+            CheckSellCondition(currentPrice, currentTime);
+            
+            // Update trailing stop
+            UpdateTrailingStop(currentPrice);
+            
+            // Reset conditions if 30 minutes have passed
+            ResetConditionsIfExpired(currentTime);
+        }
+
+        private void CheckBelowLevelC(double currentPrice, DateTime currentTime)
+        {
+            // Check if price has dropped below LevelC for the first time in past 30 minutes
+            if (currentPrice < levelC && !hasDroppedBelowLevelC)
+            {
+                // Verify this is the first time in past 30 minutes
+                bool isFirstTimeInPast30Min = true;
+                for (int i = 1; i < Math.Min(CurrentBar, GetBarsInMinutes(30)); i++)
+                {
+                    if (Close[i] < levelC)
+                    {
+                        isFirstTimeInPast30Min = false;
+                        break;
+                    }
+                }
+                
+                if (isFirstTimeInPast30Min)
+                {
+                    hasDroppedBelowLevelC = true;
+                    lastBelowLevelCTime = currentTime;
+                    buyConditionMet = false; // Reset buy condition
+                    Print($"Price dropped below LevelC ({levelC}) for first time at {currentTime}");
+                }
+            }
+        }
+
+        private void CheckAboveLevelA(double currentPrice, DateTime currentTime)
+        {
+            // Check if price has gone above LevelA for the first time in past 30 minutes
+            if (currentPrice > levelA && !hasGoneAboveLevelA)
+            {
+                // Verify this is the first time in past 30 minutes
+                bool isFirstTimeInPast30Min = true;
+                for (int i = 1; i < Math.Min(CurrentBar, GetBarsInMinutes(30)); i++)
+                {
+                    if (Close[i] > levelA)
+                    {
+                        isFirstTimeInPast30Min = false;
+                        break;
+                    }
+                }
+                
+                if (isFirstTimeInPast30Min)
+                {
+                    hasGoneAboveLevelA = true;
+                    lastAboveLevelATime = currentTime;
+                    sellConditionMet = false; // Reset sell condition
+                    Print($"Price went above LevelA ({levelA}) for first time at {currentTime}");
+                }
+            }
+        }
+
+        private void CheckBuyCondition(double currentPrice, DateTime currentTime)
+        {
+            // Check if we should place buy order at LevelB
+            if (hasDroppedBelowLevelC && !buyConditionMet && Position.MarketPosition != MarketPosition.Long)
+            {
+                // Check if within 20 minutes of dropping below LevelC
+                TimeSpan timeSinceBelowC = currentTime - lastBelowLevelCTime;
+                if (timeSinceBelowC.TotalMinutes <= 20)
+                {
+                    // Check if price has reached LevelB
+                    if (currentPrice >= levelB)
+                    {
+                        buyConditionMet = true;
+                        EnterLong("BuyAtLevelB");
+                        isLong = true;
+                        isShort = false;
+                        trailingStopPrice = currentPrice - (TrailingStopTicks * TickSize);
+                        Print($"Buy order placed at LevelB ({levelB}) at {currentTime}");
+                    }
+                }
+            }
+        }
+
+        private void CheckSellCondition(double currentPrice, DateTime currentTime)
+        {
+            // Check if we should place sell order at LevelD
+            if (hasGoneAboveLevelA && !sellConditionMet && Position.MarketPosition != MarketPosition.Short)
+            {
+                // Check if within 20 minutes of going above LevelA
+                TimeSpan timeSinceAboveA = currentTime - lastAboveLevelATime;
+                if (timeSinceAboveA.TotalMinutes <= 20)
+                {
+                    // Check if price has reached LevelD
+                    if (currentPrice <= levelD)
+                    {
+                        sellConditionMet = true;
+                        EnterShort("SellAtLevelD");
+                        isLong = false;
+                        isShort = true;
+                        trailingStopPrice = currentPrice + (TrailingStopTicks * TickSize);
+                        Print($"Sell order placed at LevelD ({levelD}) at {currentTime}");
+                    }
+                }
+            }
+        }
+
+        private void UpdateTrailingStop(double currentPrice)
+        {
+            if (Position.MarketPosition == MarketPosition.Flat)
+            {
+                isLong = false;
+                isShort = false;
+                return;
+            }
+
+            // Update trailing stop for long position
+            if (isLong && Position.MarketPosition == MarketPosition.Long)
+            {
+                double newStopPrice = currentPrice - (TrailingStopTicks * TickSize);
+                if (newStopPrice > trailingStopPrice)
+                {
+                    trailingStopPrice = newStopPrice;
+                    if (stopOrder != null)
+                    {
+                        CancelOrder(stopOrder);
+                    }
+                    stopOrder = ExitLongStopMarket(0, true, Position.Quantity, trailingStopPrice, "TrailingStop", "BuyAtLevelB");
+                }
+            }
+            
+            // Update trailing stop for short position
+            if (isShort && Position.MarketPosition == MarketPosition.Short)
+            {
+                double newStopPrice = currentPrice + (TrailingStopTicks * TickSize);
+                if (newStopPrice < trailingStopPrice)
+                {
+                    trailingStopPrice = newStopPrice;
+                    if (stopOrder != null)
+                    {
+                        CancelOrder(stopOrder);
+                    }
+                    stopOrder = ExitShortStopMarket(0, true, Position.Quantity, trailingStopPrice, "TrailingStop", "SellAtLevelD");
+                }
+            }
+        }
+
+        private void ResetConditionsIfExpired(DateTime currentTime)
+        {
+            // Reset buy condition if 30 minutes have passed since dropping below LevelC
+            if (hasDroppedBelowLevelC && (currentTime - lastBelowLevelCTime).TotalMinutes > 30)
+            {
+                hasDroppedBelowLevelC = false;
+                buyConditionMet = false;
+            }
+            
+            // Reset sell condition if 30 minutes have passed since going above LevelA
+            if (hasGoneAboveLevelA && (currentTime - lastAboveLevelATime).TotalMinutes > 30)
+            {
+                hasGoneAboveLevelA = false;
+                sellConditionMet = false;
+            }
+        }
+
+        private int GetBarsInMinutes(int minutes)
+        {
+            // Estimate bars based on bar period (this is a simplified calculation)
+            if (BarsPeriod.BarsPeriodType == BarsPeriodType.Minute)
+            {
+                return minutes / BarsPeriod.Value;
+            }
+            else if (BarsPeriod.BarsPeriodType == BarsPeriodType.Second)
+            {
+                return (minutes * 60) / BarsPeriod.Value;
+            }
+            else
+            {
+                return minutes; // Default fallback
+            }
+        }
+
+        protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice, int quantity, int filled, double averageFillPrice, OrderState orderState, DateTime time, ErrorCode error, string comment)
+        {
+            if (order.Name == "BuyAtLevelB")
+                buyOrder = order;
+            else if (order.Name == "SellAtLevelD")
+                sellOrder = order;
+            else if (order.Name == "TrailingStop")
+                stopOrder = order;
+        }
+
+        protected override void OnExecutionUpdate(Execution execution, string executionId, double price, int quantity, MarketPosition marketPosition, string orderId, DateTime time)
+        {
+            if (execution.Order.Name == "BuyAtLevelB" || execution.Order.Name == "SellAtLevelD")
+            {
+                // Position entered, trailing stop will be managed in OnBarUpdate
+                Print($"Position entered: {execution.Order.Name} at price {price}");
+            }
+        }
+
+        #region Properties
+        [NinjaScriptProperty]
+        [Range(1, double.MaxValue)]
+        [Display(Name = "Level A", Description = "Upper trigger level", Order = 1, GroupName = "Levels")]
+        public double LevelA
+        {
+            get { return levelA; }
+            set { levelA = value; }
+        }
+
+        [NinjaScriptProperty]
+        [Range(1, double.MaxValue)]
+        [Display(Name = "Level B", Description = "Buy order level", Order = 2, GroupName = "Levels")]
+        public double LevelB
+        {
+            get { return levelB; }
+            set { levelB = value; }
+        }
+
+        [NinjaScriptProperty]
+        [Range(1, double.MaxValue)]
+        [Display(Name = "Level C", Description = "Lower trigger level", Order = 3, GroupName = "Levels")]
+        public double LevelC
+        {
+            get { return levelC; }
+            set { levelC = value; }
+        }
+
+        [NinjaScriptProperty]
+        [Range(1, double.MaxValue)]
+        [Display(Name = "Level D", Description = "Sell order level", Order = 4, GroupName = "Levels")]
+        public double LevelD
+        {
+            get { return levelD; }
+            set { levelD = value; }
+        }
+
+        [NinjaScriptProperty]
+        [Range(1, int.MaxValue)]
+        [Display(Name = "Trailing Stop Ticks", Description = "Number of ticks for trailing stop", Order = 5, GroupName = "Risk Management")]
+        public int TrailingStopTicks { get; set; }
+        #endregion
+    }
+}
