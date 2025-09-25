@@ -32,6 +32,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Time tracking variables
         private DateTime lastBelowLevelCTime = DateTime.MinValue;
         private DateTime lastAboveLevelATime = DateTime.MinValue;
+        private DateTime lastTradeTime = DateTime.MinValue;
         
         // State tracking
         private bool hasDroppedBelowLevelC = false;
@@ -48,6 +49,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         private Order buyOrder = null;
         private Order sellOrder = null;
         private Order stopOrder = null;
+        
+        // Level line tracking
+        private List<double> levelALines = new List<double>();
+        private List<double> levelBLines = new List<double>();
+        private List<double> levelCLines = new List<double>();
+        private List<double> levelDLines = new List<double>();
 
         protected override void OnStateChange()
         {
@@ -55,7 +62,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 Description = @"Strategy that places buy orders at LevelB when price drops below LevelC first, and sell orders at LevelD when price goes above LevelA first, with time constraints and trailing stops.";
                 Name = "ConditionalLevelStrategy";
-                Calculate = Calculate.OnBarClose;
+                Calculate = Calculate.OnEachTick; // Changed to OnEachTick for market replay
                 EntriesPerDirection = 1;
                 EntryHandling = EntryHandling.AllEntries;
                 IsExitOnSessionCloseStrategy = true;
@@ -83,6 +90,82 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 // Add any additional configuration here
             }
+            else if (State == State.DataLoaded)
+            {
+                // Draw level lines when data is loaded
+                DrawLevelLines();
+            }
+        }
+
+        private void DrawLevelLines()
+        {
+            // Clear existing lines
+            levelALines.Clear();
+            levelBLines.Clear();
+            levelCLines.Clear();
+            levelDLines.Clear();
+            
+            // Find the price range to determine which levels to draw
+            double minPrice = double.MaxValue;
+            double maxPrice = double.MinValue;
+            
+            // Look at recent bars to determine price range
+            int barsToCheck = Math.Min(500, CurrentBar);
+            for (int i = 0; i < barsToCheck; i++)
+            {
+                if (CurrentBar - i >= 0)
+                {
+                    minPrice = Math.Min(minPrice, Low[i]);
+                    maxPrice = Math.Max(maxPrice, High[i]);
+                }
+            }
+            
+            // Expand range slightly
+            minPrice -= 100;
+            maxPrice += 100;
+            
+            // Draw LevelA lines (every 0 level: 4000, 4100, 4200, etc.)
+            for (double price = Math.Floor(minPrice / 100) * 100; price <= maxPrice; price += 100)
+            {
+                if (price % 100 == 0) // Every 0 level
+                {
+                    Draw.HorizontalLine(this, "LevelA_" + price.ToString(), price, Brushes.Red, DashStyleHelper.Solid, 2);
+                    levelALines.Add(price);
+                }
+            }
+            
+            // Draw LevelB lines (every 26 level: 4026, 4126, 4226, etc.)
+            for (double price = Math.Floor(minPrice / 100) * 100; price <= maxPrice; price += 100)
+            {
+                double levelBPrice = price + 26;
+                if (levelBPrice >= minPrice && levelBPrice <= maxPrice)
+                {
+                    Draw.HorizontalLine(this, "LevelB_" + levelBPrice.ToString(), levelBPrice, Brushes.Blue, DashStyleHelper.Solid, 2);
+                    levelBLines.Add(levelBPrice);
+                }
+            }
+            
+            // Draw LevelC lines (every 50 level: 4050, 4150, 4250, etc.)
+            for (double price = Math.Floor(minPrice / 100) * 100; price <= maxPrice; price += 100)
+            {
+                double levelCPrice = price + 50;
+                if (levelCPrice >= minPrice && levelCPrice <= maxPrice)
+                {
+                    Draw.HorizontalLine(this, "LevelC_" + levelCPrice.ToString(), levelCPrice, Brushes.Green, DashStyleHelper.Solid, 2);
+                    levelCLines.Add(levelCPrice);
+                }
+            }
+            
+            // Draw LevelD lines (every 77 level: 4077, 4177, 4277, etc.)
+            for (double price = Math.Floor(minPrice / 100) * 100; price <= maxPrice; price += 100)
+            {
+                double levelDPrice = price + 77;
+                if (levelDPrice >= minPrice && levelDPrice <= maxPrice)
+                {
+                    Draw.HorizontalLine(this, "LevelD_" + levelDPrice.ToString(), levelDPrice, Brushes.Orange, DashStyleHelper.Solid, 2);
+                    levelDLines.Add(levelDPrice);
+                }
+            }
         }
 
         protected override void OnBarUpdate()
@@ -93,16 +176,22 @@ namespace NinjaTrader.NinjaScript.Strategies
             double currentPrice = Close[0];
             DateTime currentTime = Time[0];
             
-            // Check for price dropping below LevelC for the first time in past 30 minutes
+            // Use tick data if available, otherwise use bar data
+            if (State == State.Realtime || IsReplayModeEnabled())
+            {
+                currentPrice = Close[0];
+            }
+            
+            // Check for price dropping below any LevelC for the first time in past 30 minutes
             CheckBelowLevelC(currentPrice, currentTime);
             
-            // Check for price going above LevelA for the first time in past 30 minutes
+            // Check for price going above any LevelA for the first time in past 30 minutes
             CheckAboveLevelA(currentPrice, currentTime);
             
-            // Check buy condition at LevelB
+            // Check buy condition at any LevelB
             CheckBuyCondition(currentPrice, currentTime);
             
-            // Check sell condition at LevelD
+            // Check sell condition at any LevelD
             CheckSellCondition(currentPrice, currentTime);
             
             // Update trailing stop
@@ -112,54 +201,79 @@ namespace NinjaTrader.NinjaScript.Strategies
             ResetConditionsIfExpired(currentTime);
         }
 
+        private bool IsReplayModeEnabled()
+        {
+            return Connection.PlaybackConnection != null;
+        }
+
         private void CheckBelowLevelC(double currentPrice, DateTime currentTime)
         {
-            // Check if price has dropped below LevelC for the first time in past 30 minutes
-            if (currentPrice < levelC && !hasDroppedBelowLevelC)
+            // Check if price has dropped below any LevelC for the first time in past 30 minutes
+            foreach (double levelCPrice in levelCLines)
             {
-                // Verify this is the first time in past 30 minutes
-                bool isFirstTimeInPast30Min = true;
-                for (int i = 1; i < Math.Min(CurrentBar, GetBarsInMinutes(30)); i++)
+                if (currentPrice < levelCPrice && !hasDroppedBelowLevelC)
                 {
-                    if (Close[i] < levelC)
+                    // Verify this is the first time in past 30 minutes
+                    bool isFirstTimeInPast30Min = true;
+                    for (int i = 1; i < Math.Min(CurrentBar, GetBarsInMinutes(30)); i++)
                     {
-                        isFirstTimeInPast30Min = false;
-                        break;
+                        if (Close[i] < levelCPrice)
+                        {
+                            isFirstTimeInPast30Min = false;
+                            break;
+                        }
                     }
-                }
-                
-                if (isFirstTimeInPast30Min)
-                {
-                    hasDroppedBelowLevelC = true;
-                    lastBelowLevelCTime = currentTime;
-                    buyConditionMet = false; // Reset buy condition
-                    Print($"Price dropped below LevelC ({levelC}) for first time at {currentTime}");
+                    
+                    if (isFirstTimeInPast30Min)
+                    {
+                        hasDroppedBelowLevelC = true;
+                        lastBelowLevelCTime = currentTime;
+                        buyConditionMet = false; // Reset buy condition
+                        levelC = levelCPrice; // Set the triggered level
+                        
+                        // Find corresponding LevelB (26 levels below the 50 level)
+                        double correspondingLevelB = Math.Floor(levelCPrice / 100) * 100 + 26;
+                        levelB = correspondingLevelB;
+                        
+                        Print($"Price dropped below LevelC ({levelCPrice}) for first time at {currentTime}. LevelB value: {levelB}");
+                        break; // Only trigger once
+                    }
                 }
             }
         }
 
         private void CheckAboveLevelA(double currentPrice, DateTime currentTime)
         {
-            // Check if price has gone above LevelA for the first time in past 30 minutes
-            if (currentPrice > levelA && !hasGoneAboveLevelA)
+            // Check if price has gone above any LevelA for the first time in past 30 minutes
+            foreach (double levelAPrice in levelALines)
             {
-                // Verify this is the first time in past 30 minutes
-                bool isFirstTimeInPast30Min = true;
-                for (int i = 1; i < Math.Min(CurrentBar, GetBarsInMinutes(30)); i++)
+                if (currentPrice > levelAPrice && !hasGoneAboveLevelA)
                 {
-                    if (Close[i] > levelA)
+                    // Verify this is the first time in past 30 minutes
+                    bool isFirstTimeInPast30Min = true;
+                    for (int i = 1; i < Math.Min(CurrentBar, GetBarsInMinutes(30)); i++)
                     {
-                        isFirstTimeInPast30Min = false;
-                        break;
+                        if (Close[i] > levelAPrice)
+                        {
+                            isFirstTimeInPast30Min = false;
+                            break;
+                        }
                     }
-                }
-                
-                if (isFirstTimeInPast30Min)
-                {
-                    hasGoneAboveLevelA = true;
-                    lastAboveLevelATime = currentTime;
-                    sellConditionMet = false; // Reset sell condition
-                    Print($"Price went above LevelA ({levelA}) for first time at {currentTime}");
+                    
+                    if (isFirstTimeInPast30Min)
+                    {
+                        hasGoneAboveLevelA = true;
+                        lastAboveLevelATime = currentTime;
+                        sellConditionMet = false; // Reset sell condition
+                        levelA = levelAPrice; // Set the triggered level
+                        
+                        // Find corresponding LevelD (77 levels above the 0 level)
+                        double correspondingLevelD = Math.Floor(levelAPrice / 100) * 100 + 77;
+                        levelD = correspondingLevelD;
+                        
+                        Print($"Price went above LevelA ({levelAPrice}) for first time at {currentTime}. LevelD value: {levelD}");
+                        break; // Only trigger once
+                    }
                 }
             }
         }
@@ -167,21 +281,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void CheckBuyCondition(double currentPrice, DateTime currentTime)
         {
             // Check if we should place buy order at LevelB
-            if (hasDroppedBelowLevelC && !buyConditionMet && Position.MarketPosition != MarketPosition.Long)
+            if (hasDroppedBelowLevelC && !buyConditionMet && Position.MarketPosition == MarketPosition.Flat)
             {
                 // Check if within 20 minutes of dropping below LevelC
                 TimeSpan timeSinceBelowC = currentTime - lastBelowLevelCTime;
-                if (timeSinceBelowC.TotalMinutes <= 20)
+                
+                // Check if at least 20 minutes have passed since last trade
+                TimeSpan timeSinceLastTrade = currentTime - lastTradeTime;
+                bool canTrade = lastTradeTime == DateTime.MinValue || timeSinceLastTrade.TotalMinutes >= 20;
+                
+                if (timeSinceBelowC.TotalMinutes <= 20 && canTrade)
                 {
                     // Check if price has reached LevelB
                     if (currentPrice >= levelB)
                     {
                         buyConditionMet = true;
-                        EnterLong("BuyAtLevelB");
+                        lastTradeTime = currentTime;
+                        EnterLongMarket("BuyAtLevelB");
                         isLong = true;
                         isShort = false;
                         trailingStopPrice = currentPrice - (TrailingStopTicks * TickSize);
-                        Print($"Buy order placed at LevelB ({levelB}) at {currentTime}");
+                        Print($"Market buy order placed at LevelB ({levelB}) at {currentTime}. Current price: {currentPrice}");
                     }
                 }
             }
@@ -190,21 +310,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void CheckSellCondition(double currentPrice, DateTime currentTime)
         {
             // Check if we should place sell order at LevelD
-            if (hasGoneAboveLevelA && !sellConditionMet && Position.MarketPosition != MarketPosition.Short)
+            if (hasGoneAboveLevelA && !sellConditionMet && Position.MarketPosition == MarketPosition.Flat)
             {
                 // Check if within 20 minutes of going above LevelA
                 TimeSpan timeSinceAboveA = currentTime - lastAboveLevelATime;
-                if (timeSinceAboveA.TotalMinutes <= 20)
+                
+                // Check if at least 20 minutes have passed since last trade
+                TimeSpan timeSinceLastTrade = currentTime - lastTradeTime;
+                bool canTrade = lastTradeTime == DateTime.MinValue || timeSinceLastTrade.TotalMinutes >= 20;
+                
+                if (timeSinceAboveA.TotalMinutes <= 20 && canTrade)
                 {
                     // Check if price has reached LevelD
                     if (currentPrice <= levelD)
                     {
                         sellConditionMet = true;
-                        EnterShort("SellAtLevelD");
+                        lastTradeTime = currentTime;
+                        EnterShortMarket("SellAtLevelD");
                         isLong = false;
                         isShort = true;
                         trailingStopPrice = currentPrice + (TrailingStopTicks * TickSize);
-                        Print($"Sell order placed at LevelD ({levelD}) at {currentTime}");
+                        Print($"Market sell order placed at LevelD ({levelD}) at {currentTime}. Current price: {currentPrice}");
                     }
                 }
             }
@@ -226,7 +352,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (newStopPrice > trailingStopPrice)
                 {
                     trailingStopPrice = newStopPrice;
-                    if (stopOrder != null)
+                    if (stopOrder != null && stopOrder.OrderState == OrderState.Working)
                     {
                         CancelOrder(stopOrder);
                     }
@@ -241,7 +367,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (newStopPrice < trailingStopPrice)
                 {
                     trailingStopPrice = newStopPrice;
-                    if (stopOrder != null)
+                    if (stopOrder != null && stopOrder.OrderState == OrderState.Working)
                     {
                         CancelOrder(stopOrder);
                     }
